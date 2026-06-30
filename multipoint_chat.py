@@ -7,6 +7,7 @@ import quotes
 import random
 import requests
 import json
+import heapq
 
 NAME_SERVER_ADDR = "100.27.92.54"
 NAME_SERVER_PORT = 18861
@@ -14,12 +15,14 @@ COMPARISON_SERVER_PORT = 18862
 
 BASE_PEER_PORT = 18890  # BASE_PEER_PORT + peer id
 
-N_MESSAGES = 3
+N_MESSAGES = 25  # base de mensagens = 2508 lin2508 # base de mensagens = 2508 linhas
 
 
 class MyPeer(rpyc.Service):
     def __init__(self, id, port, local=False) -> None:
         self.lock = threading.Lock()
+        self.event_clock = 0  # relógio de lamport
+        self.ack_count = {}  # ack para implementar o relógio
         self.start_event = threading.Event()
         self.id = id
         self.name = f"peer_{self.id}"
@@ -59,7 +62,8 @@ class MyPeer(rpyc.Service):
             if len(self.peers_conn) == 0:
                 time.sleep(self.id)
                 self.connect_to_all_peers()
-            self.log = []
+            self.log = []  # log final. Elementos inseridos não serão relocados
+            self.queue = []  # Fila de prioridade de mensagens esperando ACK
             self.send_ready_signal()
             self.start_event.wait()  # esperando outros peers ficarem prontos
             for message in self.messages:
@@ -102,13 +106,46 @@ class MyPeer(rpyc.Service):
             self.start_event.set()
 
     def broadcast_message(self, message):
-        # print(f"{self.name}: broadcast {message}")
+        print(f"{self.name}: broadcast {message}")
+        with self.lock:
+            self.event_clock += 1
+        timestamped_message = [self.event_clock, self.id, message]
         for conn in self.peers_conn.values():
-            conn.root.receive_message(message)
+            conn.root.receive_message(json.dumps(timestamped_message))
 
     def exposed_receive_message(self, message):
+        # print(f"{self.name}: received message {message}")
+        timestamped_message = json.loads(message)  # [clock, id, message]
         with self.lock:
-            self.log.append(message)
+            self.event_clock = max(timestamped_message[0], self.event_clock) + 1
+            heapq.heappush(self.queue, timestamped_message)
+            self.ack_message(
+                (timestamped_message[0], timestamped_message[1])
+            )  # (clock, id)
+            self.try_deliver()
+
+    def try_deliver(self):
+        # print(f"{self.name}: try_deliver()")
+        while self.queue:
+            msg = self.queue[0]
+            message_signature = (msg[0], msg[1])
+            if self.ackd_by_all(message_signature):
+                heapq.heappop(self.queue)
+                self.log.append(msg)
+                del self.ack_count[message_signature]
+            else:
+                break
+
+    def ackd_by_all(self, message_signature):
+        # print(f"{self.name}: ackd_by_all()")
+        return len(self.ack_count[message_signature]) == len(self.peers_conn)
+
+    def ack_message(self, message_signature):  # ack implicito
+        # print(f"{self.name}: ack_message()")
+        self.ack_count[message_signature] = set()
+        for message, ack_set in self.ack_count.items():
+            if message[0] < message_signature[0]:
+                ack_set.add(message_signature[1])
 
     def connect_to_name_server(self):
         print(
@@ -126,6 +163,8 @@ class MyPeer(rpyc.Service):
 
     def send_log_to_server(self):
         print(f"{self.name}: enviando log para o server")
+        while self.queue:
+            self.log.append(heapq.heappop(self.queue))
         log = json.dumps(self.log)
         assert self.cs is not None
         self.cs.root.receive_log(log)
@@ -261,8 +300,8 @@ class MyComparisonServer(rpyc.Service):
             self.peers_conn[peer] = conn
 
     def compare_logs(self):
-        for msg in self.logs[0]:
-            print(msg)
+        # for msg in self.logs[0]:
+        #     print(msg)
         unordered = 0
         lines = len(self.logs)
         colmn = len(self.logs[0])
@@ -328,17 +367,18 @@ if __name__ == "__main__":
         cs.join()
 
     elif "comparison_server" == sys.argv[1]:
-        if len(sys.argv) != 3:
-            print(f"python3 {sys.argv[0]} comparison_server N")
+        if len(sys.argv) != 2:
+            print(f"python3 {sys.argv[0]} comparison_server")
             exit()
-        expected_peers = int(sys.argv[2])
+        comparison_server_process()
     elif "name_server" == sys.argv[1]:
-        pass
+        name_server_process()
     elif "peer" == sys.argv[1]:
         if len(sys.argv) != 3:
             print(f"python3 {sys.argv[0]} peer ID")
             exit()
+        peer_process(int(sys.argv[2]))
     else:
         print(
-            f"usage: python3 {sys.argv[0]} {{local N|comparison_server N|name_server|peer ID}}"
+            f"usage: python3 {sys.argv[0]} {{local N|comparison_server|name_server|peer ID}}"
         )
